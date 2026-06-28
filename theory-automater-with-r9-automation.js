@@ -16,15 +16,30 @@ var test;
 var r9SwapActive = false;
 var r9SwapTimer = 0;
 var r9SwapCooldown = 0;
-var r9SwapStagnationTimer = 0;
-var r9SwapLastLogDb = null;
 var r9SwapPrevBoostLevels = [0, 0, 0];
 
+// R9-on growth tracking.
+var r9RateSampleTimer = 0;
+var r9RateLastLogDb = null;
+var r9BestDbRate = 0;
+var r9LowRateTimer = 0;
+
+// R9-off / swapped growth tracking.
+var r9SwapStartLogDb = null;
+var r9SwapPeakLogDb = null;
+var r9SwapLastProgressLogDb = null;
+var r9SwapNoProgressTimer = 0;
+
 // Tune these if needed.
-var r9SwapStagnationSeconds = 18; // Trigger if db has not 10x'd for this long.
-var r9SwapDurationSeconds = 60;   // Stay swapped into R1/R2/R3 for this long.
-var r9SwapCooldownSeconds = 15;   // Prevent immediate re-trigger after swapping back.
-var r9SwapDbLogFactor = 1;        // 1 = one order of magnitude = 10x db.
+var r9RateSampleIntervalSeconds = 5;      // How often to measure db velocity.
+var r9SwapTriggerSeconds = 15;            // How long growth must be slow before swapping.
+var r9TriggerRelativeRate = 0.10;         // Trigger below 10% of recent best db rate.
+var r9TriggerAbsoluteRate = 0.02;         // Also trigger below this log10(db)/sec rate.
+var r9SwapMinDurationSeconds = 20;        // Never swap back before this unless prestige/reset is detected.
+var r9SwapMaxDurationSeconds = 90;        // Never stay out of R9 longer than this.
+var r9SwapReturnNoProgressSeconds = 10;   // After min duration, return if swapped growth stalls this long.
+var r9SwapReturnMinProgress = 0.05;       // Needs this much log10(db) gain to count as progress.
+var r9SwapCooldownSeconds = 30;           // Prevent immediate re-trigger after swapping back.
 
 var upgradeCost = upgrade => upgrade.cost.getCost(upgrade.level);
 var toBig = number => BigNumber.from(number);
@@ -2160,15 +2175,27 @@ function r9GetLogDb() {
   }
 }
 
-function r9ResetStagnationMonitor() {
-  r9SwapLastLogDb = r9GetLogDb();
-  r9SwapStagnationTimer = 0;
+function r9ResetGrowthMonitor() {
+  let logDb = r9GetLogDb();
+
+  r9RateSampleTimer = 0;
+  r9RateLastLogDb = logDb;
+  r9BestDbRate = 0;
+  r9LowRateTimer = 0;
+}
+
+function r9ResetSwapMonitor() {
+  let logDb = r9GetLogDb();
+
+  r9SwapStartLogDb = logDb;
+  r9SwapPeakLogDb = logDb;
+  r9SwapLastProgressLogDb = logDb;
+  r9SwapNoProgressTimer = 0;
 }
 
 function r9RestoreBoostUpgrades() {
   // Restore R1/R2/R3 to the exact levels they had before the swap.
-  // This uses refund(-1) + buy(previous level), matching the style already used
-  // elsewhere in the script and avoiding reliance on partial refund behavior.
+  // This removes only the temporary R1/R2/R3 levels bought during the swap.
   for (let i = 0; i < 3; i++) {
     let upgrade = game.researchUpgrades[i];
     if (upgrade === undefined || !upgrade.isAvailable) continue;
@@ -2216,13 +2243,13 @@ function r9StartSwap(manual = false) {
   if (boughtTemporaryLevels <= 0) {
     r9RestoreBoostUpgrades();
     r9.buy(-1);
-    r9ResetStagnationMonitor();
+    r9ResetGrowthMonitor();
     return false;
   }
 
   r9SwapActive = true;
-  r9SwapTimer = r9SwapDurationSeconds;
-  r9ResetStagnationMonitor();
+  r9SwapTimer = 0;
+  r9ResetSwapMonitor();
   theory.invalidateQuaternaryValues();
 
   return true;
@@ -2231,7 +2258,7 @@ function r9StartSwap(manual = false) {
 function r9FinishSwap() {
   if (!r9SwapActive) return false;
 
-  // Step 4: remove only the temporary R1/R2/R3 swap purchases.
+  // Remove only the temporary R1/R2/R3 swap purchases.
   r9RestoreBoostUpgrades();
 
   // Reinvest returned students into R9.
@@ -2243,7 +2270,8 @@ function r9FinishSwap() {
   r9SwapTimer = 0;
   r9SwapCooldown = r9SwapCooldownSeconds;
   r9SwapPrevBoostLevels = [0, 0, 0];
-  r9ResetStagnationMonitor();
+
+  r9ResetGrowthMonitor();
   theory.invalidateQuaternaryValues();
 
   return true;
@@ -2257,33 +2285,100 @@ function r9ObserveMainGameGrowth(elapsedTime) {
   if (r9SwapCooldown > 0)
     r9SwapCooldown = Math.max(0, r9SwapCooldown - dt);
 
+  let logDb = r9GetLogDb();
+
+  // -------------------------
+  // While swapped out of R9
+  // -------------------------
   if (r9SwapActive) {
-    r9SwapTimer -= dt;
-    if (r9SwapTimer <= 0)
+    r9SwapTimer += dt;
+
+    // Hard safety return even if db cannot be read.
+    if (r9SwapTimer >= r9SwapMaxDurationSeconds) {
       r9FinishSwap();
+      return;
+    }
+
+    if (logDb === null || isNaN(logDb) || !isFinite(logDb))
+      return;
+
+    if (r9SwapPeakLogDb === null || logDb > r9SwapPeakLogDb)
+      r9SwapPeakLogDb = logDb;
+
+    // If db drops sharply while swapped, assume prestige/reset happened and return to R9.
+    if (r9SwapPeakLogDb !== null && logDb < r9SwapPeakLogDb - 0.25) {
+      r9FinishSwap();
+      return;
+    }
+
+    // Track whether the swapped state is still giving meaningful db progress.
+    if (
+      r9SwapLastProgressLogDb === null ||
+      logDb >= r9SwapLastProgressLogDb + r9SwapReturnMinProgress
+    ) {
+      r9SwapLastProgressLogDb = logDb;
+      r9SwapNoProgressTimer = 0;
+    } else {
+      r9SwapNoProgressTimer += dt;
+    }
+
+    // After the minimum duration, return once the swapped boost stalls.
+    if (
+      r9SwapTimer >= r9SwapMinDurationSeconds &&
+      r9SwapNoProgressTimer >= r9SwapReturnNoProgressSeconds
+    ) {
+      r9FinishSwap();
+      return;
+    }
+
     return;
   }
 
-  let logDb = r9GetLogDb();
+  // -------------------------
+  // While normally holding R9
+  // -------------------------
   if (logDb === null || isNaN(logDb) || !isFinite(logDb)) return;
 
-  // Reset monitor after graduations or large db drops.
-  if (r9SwapLastLogDb === null || logDb < r9SwapLastLogDb - 0.25) {
-    r9SwapLastLogDb = logDb;
-    r9SwapStagnationTimer = 0;
+  // Initialize or reset after graduations / large db drops.
+  if (r9RateLastLogDb === null || logDb < r9RateLastLogDb - 0.25) {
+    r9ResetGrowthMonitor();
     return;
   }
 
-  // If db increased by 10x, growth is not stagnant yet.
-  if (logDb >= r9SwapLastLogDb + r9SwapDbLogFactor) {
-    r9SwapLastLogDb = logDb;
-    r9SwapStagnationTimer = 0;
+  r9RateSampleTimer += dt;
+
+  if (r9RateSampleTimer < r9RateSampleIntervalSeconds)
+    return;
+
+  let dbRate = (logDb - r9RateLastLogDb) / r9RateSampleTimer;
+
+  r9RateLastLogDb = logDb;
+  r9RateSampleTimer = 0;
+
+  // Ignore negative samples; they usually mean a prestige/reset/update just happened.
+  if (dbRate < 0) {
+    r9ResetGrowthMonitor();
     return;
   }
 
-  r9SwapStagnationTimer += dt;
+  // Keep track of the best recent R9-on db velocity.
+  if (dbRate > r9BestDbRate) {
+    r9BestDbRate = dbRate;
+    r9LowRateTimer = 0;
+    return;
+  }
 
-  if (r9SwapStagnationTimer >= r9SwapStagnationSeconds)
+  let triggerRate = Math.max(
+    r9TriggerAbsoluteRate,
+    r9BestDbRate * r9TriggerRelativeRate
+  );
+
+  if (dbRate <= triggerRate)
+    r9LowRateTimer += r9RateSampleIntervalSeconds;
+  else
+    r9LowRateTimer = 0;
+
+  if (r9LowRateTimer >= r9SwapTriggerSeconds)
     r9StartSwap(false);
 }
 
