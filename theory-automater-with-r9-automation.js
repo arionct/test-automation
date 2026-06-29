@@ -40,6 +40,8 @@ var r9SwapMaxDurationSeconds = 90;        // Never stay out of R9 longer than th
 var r9SwapReturnNoProgressSeconds = 10;   // After min duration, return if swapped growth stalls this long.
 var r9SwapReturnMinProgress = 0.05;       // Needs this much log10(db) gain to count as progress.
 var r9SwapCooldownSeconds = 30;           // Prevent immediate re-trigger after swapping back.
+var r9StrandedRestoreTimer = 0;           // Detects reloads while stuck out of R9.
+var r9StrandedRestoreSeconds = 5;         // Auto-restore if stranded for this long.
 
 var upgradeCost = upgrade => upgrade.cost.getCost(upgrade.level);
 var toBig = number => BigNumber.from(number);
@@ -2277,6 +2279,65 @@ function r9FinishSwap() {
   return true;
 }
 
+function r9LooksStrandedOutOfR9() {
+  let r9 = game.researchUpgrades[8];
+  if (r9 === undefined || !r9.isAvailable) return false;
+
+  // If R9 is owned, we are not stranded.
+  if (r9.level > 0) return false;
+
+  // If the script thinks a swap is active, normal hard-cap logic handles it.
+  if (r9SwapActive) return false;
+
+  // If R9 is 0 and the temporary boost upgrades have levels, this is almost
+  // certainly a reload/recompile while swapped out of R9.
+  for (let i = 0; i < 3; i++) {
+    let upgrade = game.researchUpgrades[i];
+    if (upgrade !== undefined && upgrade.isAvailable && upgrade.level > 0)
+      return true;
+  }
+
+  return false;
+}
+
+function r9EmergencyRestoreR9() {
+  // This is a recovery path for when the script state was reset while the
+  // actual game state remained swapped out of R9.
+  //
+  // If r9SwapPrevBoostLevels is still available, restore exactly.
+  // If the script was reloaded and the snapshot was lost, fall back to
+  // refunding R1/R2/R3 and buying R9.
+  let hasSnapshot =
+    r9SwapPrevBoostLevels[0] > 0 ||
+    r9SwapPrevBoostLevels[1] > 0 ||
+    r9SwapPrevBoostLevels[2] > 0;
+
+  if (hasSnapshot) {
+    r9RestoreBoostUpgrades();
+  } else {
+    for (let i = 0; i < 3; i++) {
+      let upgrade = game.researchUpgrades[i];
+      if (upgrade !== undefined && upgrade.isAvailable)
+        upgrade.refund(-1);
+    }
+  }
+
+  let r9 = game.researchUpgrades[8];
+  if (r9 !== undefined && r9.isAvailable)
+    r9.buy(-1);
+
+  r9SwapActive = false;
+  r9SwapTimer = 0;
+  r9SwapCooldown = r9SwapCooldownSeconds;
+  r9StrandedRestoreTimer = 0;
+  r9SwapPrevBoostLevels = [0, 0, 0];
+
+  r9ResetGrowthMonitor();
+  theory.invalidateQuaternaryValues();
+
+  return true;
+}
+
 function r9ObserveMainGameGrowth(elapsedTime) {
   if (game.isCalculatingOfflineProgress) return;
 
@@ -2286,6 +2347,19 @@ function r9ObserveMainGameGrowth(elapsedTime) {
     r9SwapCooldown = Math.max(0, r9SwapCooldown - dt);
 
   let logDb = r9GetLogDb();
+
+  // Recovery path: if the script was reloaded while swapped out of R9,
+  // r9SwapActive may be false even though R9 is still 0.
+  if (!r9SwapActive && r9LooksStrandedOutOfR9()) {
+    r9StrandedRestoreTimer += dt;
+
+    if (r9StrandedRestoreTimer >= r9StrandedRestoreSeconds) {
+      r9EmergencyRestoreR9();
+      return;
+    }
+  } else if (!r9SwapActive) {
+    r9StrandedRestoreTimer = 0;
+  }
 
   // -------------------------
   // While swapped out of R9
@@ -2386,8 +2460,11 @@ var r9Seap = () => {
   // Manual override:
   // press once to force a swap cycle;
   // press again during the swap to restore R9 early.
+  // If the script was reloaded while out of R9, recover R9 instead.
   if (r9SwapActive)
     r9FinishSwap();
+  else if (r9LooksStrandedOutOfR9())
+    r9EmergencyRestoreR9();
   else
     r9StartSwap(true);
 }
