@@ -17,6 +17,8 @@ var r9SwapActive = false;
 var r9SwapTimer = 0;
 var r9SwapCooldown = 0;
 var r9SwapPrevBoostLevels = [0, 0, 0];
+var r9SwapBoughtBoostLevels = [0, 0, 0];
+var r9SwapSnapshotValid = false;
 
 // R9-on growth tracking.
 var r9RateSampleTimer = 0;
@@ -2196,15 +2198,27 @@ function r9ResetSwapMonitor() {
 }
 
 function r9RestoreBoostUpgrades() {
-  // Restore R1/R2/R3 to the exact levels they had before the swap.
-  // This removes only the temporary R1/R2/R3 levels bought during the swap.
+  // Refund only the levels bought during the R9 swap.
+  // Do NOT refund all of R1/R2/R3.
   for (let i = 0; i < 3; i++) {
     let upgrade = game.researchUpgrades[i];
     if (upgrade === undefined || !upgrade.isAvailable) continue;
 
-    if (upgrade.level > r9SwapPrevBoostLevels[i]) {
-      upgrade.refund(-1);
-      upgrade.buy(r9SwapPrevBoostLevels[i]);
+    let targetLevel = r9SwapPrevBoostLevels[i];
+    let levelsToRefund = Math.min(
+      r9SwapBoughtBoostLevels[i],
+      Math.max(0, upgrade.level - targetLevel)
+    );
+
+    while (levelsToRefund > 0 && upgrade.level > targetLevel) {
+      let levelBefore = upgrade.level;
+      upgrade.refund(1);
+
+      // Safety guard in case refund(1) ever fails.
+      if (upgrade.level >= levelBefore)
+        break;
+
+      levelsToRefund--;
     }
   }
 }
@@ -2224,6 +2238,8 @@ function r9StartSwap(manual = false) {
     game.researchUpgrades[2]?.level ?? 0
   ];
 
+  r9SwapSnapshotValid = true;
+
   // Step 1: refund R9.
   r9.refund(-1);
 
@@ -2234,17 +2250,24 @@ function r9StartSwap(manual = false) {
       upgrade.buy(-1);
   }
 
+  r9SwapBoughtBoostLevels = [0, 0, 0];
+
   let boughtTemporaryLevels = 0;
   for (let i = 0; i < 3; i++) {
     let upgrade = game.researchUpgrades[i];
-    if (upgrade !== undefined)
-      boughtTemporaryLevels += Math.max(0, upgrade.level - r9SwapPrevBoostLevels[i]);
+    if (upgrade !== undefined) {
+      r9SwapBoughtBoostLevels[i] = Math.max(0, upgrade.level - r9SwapPrevBoostLevels[i]);
+      boughtTemporaryLevels += r9SwapBoughtBoostLevels[i];
+    }
   }
 
   // If the refunded R9 students could not buy any R1/R2/R3 levels, undo immediately.
   if (boughtTemporaryLevels <= 0) {
     r9RestoreBoostUpgrades();
     r9.buy(-1);
+    r9SwapPrevBoostLevels = [0, 0, 0];
+    r9SwapBoughtBoostLevels = [0, 0, 0];
+    r9SwapSnapshotValid = false;
     r9ResetGrowthMonitor();
     return false;
   }
@@ -2272,6 +2295,8 @@ function r9FinishSwap() {
   r9SwapTimer = 0;
   r9SwapCooldown = r9SwapCooldownSeconds;
   r9SwapPrevBoostLevels = [0, 0, 0];
+  r9SwapBoughtBoostLevels = [0, 0, 0];
+  r9SwapSnapshotValid = false;
 
   r9ResetGrowthMonitor();
   theory.invalidateQuaternaryValues();
@@ -2289,11 +2314,18 @@ function r9LooksStrandedOutOfR9() {
   // If the script thinks a swap is active, normal hard-cap logic handles it.
   if (r9SwapActive) return false;
 
-  // If R9 is 0 and the temporary boost upgrades have levels, this is almost
-  // certainly a reload/recompile while swapped out of R9.
+  // Only auto-recover if the script still knows exactly what it bought.
+  if (!r9SwapSnapshotValid)
+    return false;
+
   for (let i = 0; i < 3; i++) {
     let upgrade = game.researchUpgrades[i];
-    if (upgrade !== undefined && upgrade.isAvailable && upgrade.level > 0)
+    if (
+      upgrade !== undefined &&
+      upgrade.isAvailable &&
+      r9SwapBoughtBoostLevels[i] > 0 &&
+      upgrade.level >= r9SwapPrevBoostLevels[i] + r9SwapBoughtBoostLevels[i]
+    )
       return true;
   }
 
@@ -2301,26 +2333,15 @@ function r9LooksStrandedOutOfR9() {
 }
 
 function r9EmergencyRestoreR9() {
-  // This is a recovery path for when the script state was reset while the
-  // actual game state remained swapped out of R9.
-  //
-  // If r9SwapPrevBoostLevels is still available, restore exactly.
-  // If the script was reloaded and the snapshot was lost, fall back to
-  // refunding R1/R2/R3 and buying R9.
-  let hasSnapshot =
-    r9SwapPrevBoostLevels[0] > 0 ||
-    r9SwapPrevBoostLevels[1] > 0 ||
-    r9SwapPrevBoostLevels[2] > 0;
-
-  if (hasSnapshot) {
-    r9RestoreBoostUpgrades();
-  } else {
-    for (let i = 0; i < 3; i++) {
-      let upgrade = game.researchUpgrades[i];
-      if (upgrade !== undefined && upgrade.isAvailable)
-        upgrade.refund(-1);
-    }
+  // Only restore automatically if we still have the exact swap snapshot.
+  // If the script was reloaded and the snapshot was lost, DO NOT refund
+  // all of R1/R2/R3. That would destroy the user's normal research setup.
+  if (!r9SwapSnapshotValid) {
+    r9StrandedRestoreTimer = 0;
+    return false;
   }
+
+  r9RestoreBoostUpgrades();
 
   let r9 = game.researchUpgrades[8];
   if (r9 !== undefined && r9.isAvailable)
@@ -2331,6 +2352,8 @@ function r9EmergencyRestoreR9() {
   r9SwapCooldown = r9SwapCooldownSeconds;
   r9StrandedRestoreTimer = 0;
   r9SwapPrevBoostLevels = [0, 0, 0];
+  r9SwapBoughtBoostLevels = [0, 0, 0];
+  r9SwapSnapshotValid = false;
 
   r9ResetGrowthMonitor();
   theory.invalidateQuaternaryValues();
