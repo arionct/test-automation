@@ -45,44 +45,101 @@ var r9SwapCooldownSeconds = 30;           // Prevent immediate re-trigger after 
 var r9StrandedRestoreTimer = 0;           // Detects reloads while stuck out of R9.
 var r9StrandedRestoreSeconds = 5;         // Auto-restore if stranded for this long.
 
+// Persisted R9 swap state. Custom upgrade levels are saved by the game, unlike
+// plain JavaScript variables, so these slots make offline/reload swaps safe.
+var r9StateUpgrades = [];
+var r9StateLoaded = false;
+var r9StateStartId = 12;
+var r9StateUpgradeCount = 35;
+var r9StateTimerScale = 10;
+var r9StateFloatScale = 10000;
+var r9UiRefreshTimer = 0;
+
+var r9StateActiveSlot = 0;
+var r9StateSnapshotSlot = 1;
+var r9StatePrevBoostSlot = 2;
+var r9StateBoughtBoostSlot = 5;
+var r9StateSwapTimerSlot = 8;
+var r9StateCooldownSlot = 9;
+var r9StateRateSampleTimerSlot = 10;
+var r9StateRateLastLogDbSlot = 11;
+var r9StateBestDbRateSlot = 12;
+var r9StateLowRateTimerSlot = 13;
+var r9StateSwapStartLogDbSlot = 14;
+var r9StateSwapPeakLogDbSlot = 15;
+var r9StateSwapLastProgressLogDbSlot = 16;
+var r9StateSwapNoProgressTimerSlot = 17;
+var r9StateStrandedRestoreTimerSlot = 18;
+var r9StateLastTriggerReasonSlot = 19;
+var r9StateLastRestoreReasonSlot = 20;
+var r9StateAutoSwapCountSlot = 21;
+var r9StateEventSequenceSlot = 22;
+var r9StateEventBaseSlot = 23;
+var r9StateEventSlotSize = 3;
+var r9StateEventCount = 4;
+
+var r9ReasonNone = 0;
+var r9ReasonLowRate = 1;
+var r9ReasonManual = 2;
+var r9ReasonHardCap = 3;
+var r9ReasonDbReset = 4;
+var r9ReasonNoProgress = 5;
+var r9ReasonStranded = 6;
+var r9ReasonNoBoost = 7;
+var r9ReasonSnapshotInvalid = 8;
+var r9ReasonR9Failed = 9;
+var r9ReasonBoostMismatch = 10;
+
+var r9EventNone = 0;
+var r9EventAutoSwap = 1;
+var r9EventManualSwap = 2;
+var r9EventRestore = 3;
+var r9EventEmergencyRestore = 4;
+var r9EventBlocked = 5;
+
+var r9ValidationUnknown = 0;
+var r9ValidationOk = 1;
+var r9ValidationR9Failed = 2;
+var r9ValidationBoostMismatch = 3;
+
+var r9LastTriggerReason = r9ReasonNone;
+var r9LastRestoreReason = r9ReasonNone;
+var r9AutoSwapCount = 0;
+var r9EventSequence = 0;
+
 var upgradeCost = upgrade => upgrade.cost.getCost(upgrade.level);
 var toBig = number => BigNumber.from(number);
 var publicationMultiplier = theory => theory.nextPublicationMultiplier / theory.publicationMultiplier;
 var getR9 = () => (game.sigmaTotal / 20) ** game.researchUpgrades[8].level;
 
 var primaryEquation = "";
-theory.primaryEquationHeight = 45;
+theory.primaryEquationHeight = 85;
 function getPrimaryEquation() {
 
   if (primaryEquation != "") return primaryEquation;
 
-  if (game.activeTheory === null || game.activeTheory.id === 8) return "";
-
-  let coastText = "\\begin{eqnarray}";
-  if (theoryManager.id != 1 && theoryManager.id != 2)
-    coastText += "Coast\\;" + theoryManager.theory.latexSymbol + "&=&" + theoryManager.coast + "\\\\";
-  else
-    coastText += "Phase&=&" + theoryManager.phase + "\\\\";
-
-  let pubTau = theoryManager.pub;
-  if (theoryManager.id == 1)
-    pubTau = theoryManager.theory.tauPublished * theoryManager.pub ** (1 / 0.198);
-  else if (theoryManager.id == 2)
-    pubTau = theoryManager.theory.tauPublished * theoryManager.pub ** (1 / 0.147);
-
-  return coastText + "Next\\;\\overline{" + theoryManager.theory.latexSymbol + "}&=&" + pubTau + "\\end{eqnarray}";
+  return "\\begin{array}{l}" +
+    "R9\\;log:\\;" + r9LatexText(r9GetStatusText()) + "\\\\" +
+    r9LatexText(r9FormatEventText(r9ReadEvent(0))) + "\\\\" +
+    r9LatexText(r9FormatEventText(r9ReadEvent(1))) + "\\\\" +
+    r9LatexText(r9FormatEventText(r9ReadEvent(2))) +
+    "\\end{array}";
 
 }
 
 var secondaryEquation = "";
 var getSecondaryEquation = () => "" + secondaryEquation;
 
-var quaternaryEntries = [];
-for (let i = 0; i < 8; i++) {
-  quaternaryEntries.push(new QuaternaryEntry("τ_" + (i + 1), 0));
-}
-var getQuaternaryEntries = () => {
+var quaternaryEntries = [
+  new QuaternaryEntry("State", ""),
+  new QuaternaryEntry("Tmp\\;R1/R2/R3", ""),
+  new QuaternaryEntry("Trigger", ""),
+  new QuaternaryEntry("Restore", ""),
+  new QuaternaryEntry("Auto\\;swaps", ""),
+  new QuaternaryEntry("Mode", "")
+];
 
+function getTheorySwitchScores() {
   let decay = [
     30.1935671759384,
     37.4972532637665,
@@ -105,6 +162,11 @@ var getQuaternaryEntries = () => {
     4.93
   ];
 
+  let scores = [0, 0, 0, 0, 0, 0, 0, 0];
+  let r9Power = R9;
+  if (r9Power === undefined || isNaN(r9Power))
+    r9Power = getR9();
+
   let tau;
   let tauH;
 
@@ -114,15 +176,12 @@ var getQuaternaryEntries = () => {
     } catch (e) {
       tau = 1;
     }
-    tauH = base[i] * R9 ** (1 / timeMult[i]) / 2 ** ((tau - requirements[i]) / decay[i]);
-    quaternaryEntries[i].value = formatQValue(tauH);
-  }
-  for (let i = game.researchUpgrades[7].level; i < 8; i++) {
-    quaternaryEntries[i].value = formatQValue(0);
+    tauH = base[i] * r9Power ** (1 / timeMult[i]) / 2 ** ((tau - requirements[i]) / decay[i]);
+    scores[i] = tauH;
   }
 
   // T4 low tau check
-  if (game.researchUpgrades[7].level < 4) return quaternaryEntries;
+  if (game.researchUpgrades[7].level < 4) return scores;
 
   decay = 27.0085302950228;
   base = 1.51;
@@ -133,11 +192,11 @@ var getQuaternaryEntries = () => {
   } catch (e) {
     tau = 1;
   }
-  tauH = base * R9 ** (1 / timeMult) / 2 ** ((tau - requirements[3]) / decay);
-  quaternaryEntries[3].value = formatQValue(Math.max(tauH, quaternaryEntries[3].value));
+  tauH = base * r9Power ** (1 / timeMult) / 2 ** ((tau - requirements[3]) / decay);
+  scores[3] = Math.max(tauH, scores[3]);
 
   // T6 low tau check
-  if (game.researchUpgrades[7].level < 6) return quaternaryEntries;
+  if (game.researchUpgrades[7].level < 6) return scores;
 
   decay = 70.0732254255212;
   base = 7;
@@ -148,8 +207,21 @@ var getQuaternaryEntries = () => {
   } catch (e) {
     tau = 1;
   }
-  tauH = base * R9 ** (1 / timeMult) / 2 ** ((tau - requirements[5]) / decay);
-  quaternaryEntries[5].value = formatQValue(Math.max(tauH, quaternaryEntries[5].value));
+  tauH = base * r9Power ** (1 / timeMult) / 2 ** ((tau - requirements[5]) / decay);
+  scores[5] = Math.max(tauH, scores[5]);
+
+  return scores;
+
+}
+
+var getQuaternaryEntries = () => {
+
+  quaternaryEntries[0].value = r9GetStatusText();
+  quaternaryEntries[1].value = r9SwapBoughtBoostLevels.join("/");
+  quaternaryEntries[2].value = r9ReasonText(r9LastTriggerReason);
+  quaternaryEntries[3].value = r9ReasonText(r9LastRestoreReason);
+  quaternaryEntries[4].value = "" + r9AutoSwapCount;
+  quaternaryEntries[5].value = game.isCalculatingOfflineProgress ? "offline" : "live";
 
   return quaternaryEntries;
 
@@ -205,9 +277,10 @@ function switchTheory(manualSwitch = false) {
 
   let iMax = -1;
   let max = 0;
+  let switchScores = getTheorySwitchScores();
   for (let i = 0; i < Math.min(8, game.researchUpgrades[7].level); i++) {
     if (!theory.upgrades[i].level) continue;
-    let value = parseFloat(theory.quaternaryValue(i));
+    let value = switchScores[i];
     if (value > max) {
       iMax = i;
       max = value;
@@ -2165,6 +2238,324 @@ class T8 {
 
 }
 
+function r9ClampInt(value, maxValue = 2000000000) {
+  if (value === null || value === undefined || isNaN(value) || !isFinite(value))
+    return 0;
+
+  value = Math.round(value);
+  if (value < 0) return 0;
+  if (value > maxValue) return maxValue;
+  return value;
+}
+
+function r9IsStateReady() {
+  return r9StateUpgrades.length >= r9StateUpgradeCount;
+}
+
+function r9ReadStateSlot(slot, defaultValue = 0) {
+  if (!r9IsStateReady() || r9StateUpgrades[slot] === undefined)
+    return defaultValue;
+
+  let value = r9StateUpgrades[slot].level;
+  return value === undefined ? defaultValue : value;
+}
+
+function r9WriteStateSlot(slot, value) {
+  if (!r9IsStateReady() || r9StateUpgrades[slot] === undefined)
+    return;
+
+  r9StateUpgrades[slot].level = r9ClampInt(value);
+}
+
+function r9EncodeTimer(value) {
+  return r9ClampInt(value * r9StateTimerScale);
+}
+
+function r9DecodeTimer(value) {
+  return Math.max(0, value) / r9StateTimerScale;
+}
+
+function r9EncodeFloat(value) {
+  if (value === null || value === undefined || isNaN(value) || !isFinite(value))
+    return 0;
+
+  return r9ClampInt(value * r9StateFloatScale + 1);
+}
+
+function r9DecodeFloat(value) {
+  if (value <= 0) return null;
+  return (value - 1) / r9StateFloatScale;
+}
+
+function r9CreateHiddenStateUpgrade(slot) {
+  let upgrade = theory.createUpgrade(r9StateStartId + slot, fictitiousCurrency, new FreeCost);
+  upgrade.isAvailable = false;
+  upgrade.isAutoBuyable = false;
+  upgrade.maxLevel = 2000000000;
+  upgrade.description = "";
+  upgrade.info = "";
+  r9StateUpgrades[slot] = upgrade;
+}
+
+function r9SavePersistentState() {
+  if (!r9IsStateReady()) return;
+
+  r9WriteStateSlot(r9StateActiveSlot, r9SwapActive ? 1 : 0);
+  r9WriteStateSlot(r9StateSnapshotSlot, r9SwapSnapshotValid ? 1 : 0);
+  for (let i = 0; i < 3; i++) {
+    r9WriteStateSlot(r9StatePrevBoostSlot + i, r9SwapPrevBoostLevels[i]);
+    r9WriteStateSlot(r9StateBoughtBoostSlot + i, r9SwapBoughtBoostLevels[i]);
+  }
+
+  r9WriteStateSlot(r9StateSwapTimerSlot, r9EncodeTimer(r9SwapTimer));
+  r9WriteStateSlot(r9StateCooldownSlot, r9EncodeTimer(r9SwapCooldown));
+  r9WriteStateSlot(r9StateRateSampleTimerSlot, r9EncodeTimer(r9RateSampleTimer));
+  r9WriteStateSlot(r9StateRateLastLogDbSlot, r9EncodeFloat(r9RateLastLogDb));
+  r9WriteStateSlot(r9StateBestDbRateSlot, r9EncodeFloat(r9BestDbRate));
+  r9WriteStateSlot(r9StateLowRateTimerSlot, r9EncodeTimer(r9LowRateTimer));
+  r9WriteStateSlot(r9StateSwapStartLogDbSlot, r9EncodeFloat(r9SwapStartLogDb));
+  r9WriteStateSlot(r9StateSwapPeakLogDbSlot, r9EncodeFloat(r9SwapPeakLogDb));
+  r9WriteStateSlot(r9StateSwapLastProgressLogDbSlot, r9EncodeFloat(r9SwapLastProgressLogDb));
+  r9WriteStateSlot(r9StateSwapNoProgressTimerSlot, r9EncodeTimer(r9SwapNoProgressTimer));
+  r9WriteStateSlot(r9StateStrandedRestoreTimerSlot, r9EncodeTimer(r9StrandedRestoreTimer));
+  r9WriteStateSlot(r9StateLastTriggerReasonSlot, r9LastTriggerReason);
+  r9WriteStateSlot(r9StateLastRestoreReasonSlot, r9LastRestoreReason);
+  r9WriteStateSlot(r9StateAutoSwapCountSlot, r9AutoSwapCount);
+  r9WriteStateSlot(r9StateEventSequenceSlot, r9EventSequence);
+}
+
+function r9LoadPersistentState() {
+  if (r9StateLoaded || !r9IsStateReady()) return;
+
+  r9SwapActive = r9ReadStateSlot(r9StateActiveSlot) > 0;
+  r9SwapSnapshotValid = r9ReadStateSlot(r9StateSnapshotSlot) > 0;
+
+  for (let i = 0; i < 3; i++) {
+    r9SwapPrevBoostLevels[i] = r9ReadStateSlot(r9StatePrevBoostSlot + i);
+    r9SwapBoughtBoostLevels[i] = r9ReadStateSlot(r9StateBoughtBoostSlot + i);
+  }
+
+  r9SwapTimer = r9DecodeTimer(r9ReadStateSlot(r9StateSwapTimerSlot));
+  r9SwapCooldown = r9DecodeTimer(r9ReadStateSlot(r9StateCooldownSlot));
+  r9RateSampleTimer = r9DecodeTimer(r9ReadStateSlot(r9StateRateSampleTimerSlot));
+  r9RateLastLogDb = r9DecodeFloat(r9ReadStateSlot(r9StateRateLastLogDbSlot));
+  r9BestDbRate = r9DecodeFloat(r9ReadStateSlot(r9StateBestDbRateSlot)) ?? 0;
+  r9LowRateTimer = r9DecodeTimer(r9ReadStateSlot(r9StateLowRateTimerSlot));
+  r9SwapStartLogDb = r9DecodeFloat(r9ReadStateSlot(r9StateSwapStartLogDbSlot));
+  r9SwapPeakLogDb = r9DecodeFloat(r9ReadStateSlot(r9StateSwapPeakLogDbSlot));
+  r9SwapLastProgressLogDb = r9DecodeFloat(r9ReadStateSlot(r9StateSwapLastProgressLogDbSlot));
+  r9SwapNoProgressTimer = r9DecodeTimer(r9ReadStateSlot(r9StateSwapNoProgressTimerSlot));
+  r9StrandedRestoreTimer = r9DecodeTimer(r9ReadStateSlot(r9StateStrandedRestoreTimerSlot));
+  r9LastTriggerReason = r9ReadStateSlot(r9StateLastTriggerReasonSlot);
+  r9LastRestoreReason = r9ReadStateSlot(r9StateLastRestoreReasonSlot);
+  r9AutoSwapCount = r9ReadStateSlot(r9StateAutoSwapCountSlot);
+  r9EventSequence = r9ReadStateSlot(r9StateEventSequenceSlot);
+
+  if (r9SwapActive && !r9SwapSnapshotValid) {
+    r9SwapActive = false;
+    r9LastRestoreReason = r9ReasonSnapshotInvalid;
+  }
+
+  let r9 = game.researchUpgrades[8];
+  if (r9SwapActive && r9 !== undefined && r9.level > 0) {
+    r9SwapActive = false;
+    r9SwapTimer = 0;
+    r9SwapPrevBoostLevels = [0, 0, 0];
+    r9SwapBoughtBoostLevels = [0, 0, 0];
+    r9SwapSnapshotValid = false;
+    r9LastRestoreReason = r9ReasonManual;
+  }
+
+  r9StateLoaded = true;
+  r9SavePersistentState();
+}
+
+function r9EventSlot(slot, offset) {
+  return r9StateEventBaseSlot + slot * r9StateEventSlotSize + offset;
+}
+
+function r9CopyEventSlot(fromSlot, toSlot) {
+  for (let i = 0; i < r9StateEventSlotSize; i++)
+    r9WriteStateSlot(r9EventSlot(toSlot, i), r9ReadStateSlot(r9EventSlot(fromSlot, i)));
+}
+
+function r9EncodeTempBoosts() {
+  return r9ClampInt(r9SwapBoughtBoostLevels[0], 999) * 1000000 +
+    r9ClampInt(r9SwapBoughtBoostLevels[1], 999) * 1000 +
+    r9ClampInt(r9SwapBoughtBoostLevels[2], 999);
+}
+
+function r9DecodeTempBoosts(value) {
+  let r1 = Math.floor(value / 1000000);
+  let r2 = Math.floor(value / 1000) % 1000;
+  let r3 = value % 1000;
+  return [r1, r2, r3];
+}
+
+function r9RecordEvent(eventType, reasonCode, durationSeconds = 0, validationCode = r9ValidationUnknown) {
+  if (!r9IsStateReady()) return;
+
+  if (eventType == r9EventAutoSwap) {
+    r9AutoSwapCount++;
+    r9LastTriggerReason = reasonCode;
+  }
+  if (eventType == r9EventManualSwap)
+    r9LastTriggerReason = reasonCode;
+  if (eventType == r9EventRestore || eventType == r9EventEmergencyRestore)
+    r9LastRestoreReason = reasonCode;
+
+  r9EventSequence = r9ClampInt(r9EventSequence + 1);
+
+  for (let i = r9StateEventCount - 1; i > 0; i--)
+    r9CopyEventSlot(i - 1, i);
+
+  let logDb = r9GetLogDb();
+  let roundedLogDb = logDb === null ? 0 : r9ClampInt(logDb, 999999);
+  let roundedDuration = r9ClampInt(durationSeconds, 999);
+  let sequence = r9EventSequence % 10000;
+  let offlineFlag = game.isCalculatingOfflineProgress ? 1 : 0;
+
+  r9WriteStateSlot(r9EventSlot(0, 0),
+    sequence * 100000 +
+    eventType * 10000 +
+    reasonCode * 100 +
+    validationCode * 10 +
+    offlineFlag
+  );
+  r9WriteStateSlot(r9EventSlot(0, 1), roundedLogDb * 1000 + roundedDuration);
+  r9WriteStateSlot(r9EventSlot(0, 2), r9EncodeTempBoosts());
+
+  r9SavePersistentState();
+  r9InvalidateStatusUi();
+}
+
+function r9ReadEvent(slot) {
+  if (!r9IsStateReady()) {
+    return {
+      type: r9EventNone,
+      reason: r9ReasonNone,
+      validation: r9ValidationUnknown,
+      sequence: 0,
+      logDb: 0,
+      duration: 0,
+      temp: [0, 0, 0],
+      offline: false
+    };
+  }
+
+  let encodedA = r9ReadStateSlot(r9EventSlot(slot, 0));
+  if (encodedA <= 0) {
+    return {
+      type: r9EventNone,
+      reason: r9ReasonNone,
+      validation: r9ValidationUnknown,
+      sequence: 0,
+      logDb: 0,
+      duration: 0,
+      temp: [0, 0, 0],
+      offline: false
+    };
+  }
+
+  let encodedB = r9ReadStateSlot(r9EventSlot(slot, 1));
+  let encodedC = r9ReadStateSlot(r9EventSlot(slot, 2));
+
+  return {
+    sequence: Math.floor(encodedA / 100000),
+    type: Math.floor(encodedA / 10000) % 10,
+    reason: Math.floor(encodedA / 100) % 100,
+    validation: Math.floor(encodedA / 10) % 10,
+    offline: encodedA % 10 == 1,
+    logDb: Math.floor(encodedB / 1000),
+    duration: encodedB % 1000,
+    temp: r9DecodeTempBoosts(encodedC)
+  };
+}
+
+function r9ReasonText(reasonCode) {
+  switch (reasonCode) {
+    case r9ReasonLowRate: return "low rate";
+    case r9ReasonManual: return "manual";
+    case r9ReasonHardCap: return "hard cap";
+    case r9ReasonDbReset: return "db reset";
+    case r9ReasonNoProgress: return "stall";
+    case r9ReasonStranded: return "stranded";
+    case r9ReasonNoBoost: return "no boost";
+    case r9ReasonSnapshotInvalid: return "snapshot invalid";
+    case r9ReasonR9Failed: return "R9 failed";
+    case r9ReasonBoostMismatch: return "R1-3 mismatch";
+  }
+  return "none";
+}
+
+function r9ValidationText(validationCode) {
+  switch (validationCode) {
+    case r9ValidationOk: return "ok";
+    case r9ValidationR9Failed: return "R9 fail";
+    case r9ValidationBoostMismatch: return "R1-3 fail";
+  }
+  return "";
+}
+
+function r9FormatEventText(event) {
+  if (event.type == r9EventNone)
+    return "No R9 swap events yet";
+
+  let mode = event.offline ? " O" : " L";
+  let sequence = "n" + event.sequence + " ";
+  let temp = event.temp.join("/");
+
+  if (event.type == r9EventAutoSwap)
+    return sequence + "auto in e" + event.logDb + " +" + temp + mode;
+  if (event.type == r9EventManualSwap)
+    return sequence + "manual in e" + event.logDb + " +" + temp + mode;
+  if (event.type == r9EventRestore || event.type == r9EventEmergencyRestore) {
+    let validation = r9ValidationText(event.validation);
+    validation = validation == "" ? "" : " " + validation;
+    return sequence + "out " + r9ReasonText(event.reason) + " " + event.duration + "s" + validation + mode;
+  }
+  if (event.type == r9EventBlocked)
+    return sequence + "blocked " + r9ReasonText(event.reason) + mode;
+
+  return sequence + "R9 event" + mode;
+}
+
+function r9LatexText(text) {
+  return ("" + text).replace(/ /g, "\\;");
+}
+
+function r9GetStatusText() {
+  let r9 = game.researchUpgrades[8];
+
+  if (r9SwapActive)
+    return "SWAPPED " + Math.floor(r9SwapTimer) + "s";
+
+  if (r9 !== undefined && r9.isAvailable && r9.level <= 0)
+    return r9SwapSnapshotValid ? "RESTORE READY" : "SNAPSHOT INVALID";
+
+  if (r9SwapCooldown > 0)
+    return "COOLDOWN " + Math.ceil(r9SwapCooldown) + "s";
+
+  if (r9 !== undefined && r9.isAvailable && r9.level > 0)
+    return "ON";
+
+  return "UNAVAILABLE";
+}
+
+function r9InvalidateStatusUi() {
+  theory.invalidatePrimaryEquation();
+  theory.invalidateQuaternaryValues();
+}
+
+function r9MaybeRefreshStatusUi(dt) {
+  r9UiRefreshTimer += dt;
+  if (r9UiRefreshTimer < 1) return;
+
+  r9UiRefreshTimer = 0;
+  if (r9SwapActive || r9SwapCooldown > 0 || game.isCalculatingOfflineProgress)
+    r9InvalidateStatusUi();
+}
+
 function r9GetLogDb() {
   try {
     if (game.db <= 0) return null;
@@ -2197,7 +2588,29 @@ function r9ResetSwapMonitor() {
   r9SwapNoProgressTimer = 0;
 }
 
+function r9PersistAfterObserve(dt) {
+  r9SavePersistentState();
+  r9MaybeRefreshStatusUi(dt);
+}
+
+function r9ValidateRestore(expectedBoostLevels) {
+  let r9 = game.researchUpgrades[8];
+  if (r9 === undefined || !r9.isAvailable || r9.level <= 0)
+    return r9ValidationR9Failed;
+
+  for (let i = 0; i < 3; i++) {
+    let upgrade = game.researchUpgrades[i];
+    let level = upgrade === undefined ? 0 : upgrade.level;
+    if (level != expectedBoostLevels[i])
+      return r9ValidationBoostMismatch;
+  }
+
+  return r9ValidationOk;
+}
+
 function r9RestoreBoostUpgrades() {
+  if (!r9SwapSnapshotValid) return false;
+
   // Refund only the levels bought during the R9 swap.
   // Do NOT refund all of R1/R2/R3.
   for (let i = 0; i < 3; i++) {
@@ -2221,12 +2634,15 @@ function r9RestoreBoostUpgrades() {
       levelsToRefund--;
     }
   }
+
+  return true;
 }
 
-function r9StartSwap(manual = false) {
+function r9StartSwap(manual = false, reason = r9ReasonLowRate) {
+  r9LoadPersistentState();
+
   if (r9SwapActive) return false;
   if (r9SwapCooldown > 0 && !manual) return false;
-  if (game.isCalculatingOfflineProgress) return false;
 
   let r9 = game.researchUpgrades[8];
   if (r9 === undefined || !r9.isAvailable || r9.level <= 0) return false;
@@ -2265,23 +2681,39 @@ function r9StartSwap(manual = false) {
   if (boughtTemporaryLevels <= 0) {
     r9RestoreBoostUpgrades();
     r9.buy(-1);
+    r9RecordEvent(r9EventBlocked, r9ReasonNoBoost);
     r9SwapPrevBoostLevels = [0, 0, 0];
     r9SwapBoughtBoostLevels = [0, 0, 0];
     r9SwapSnapshotValid = false;
     r9ResetGrowthMonitor();
+    r9SavePersistentState();
     return false;
   }
 
   r9SwapActive = true;
   r9SwapTimer = 0;
   r9ResetSwapMonitor();
-  theory.invalidateQuaternaryValues();
+  r9RecordEvent(manual ? r9EventManualSwap : r9EventAutoSwap, reason);
+  r9InvalidateStatusUi();
 
   return true;
 }
 
-function r9FinishSwap() {
+function r9FinishSwap(reason = r9ReasonManual) {
   if (!r9SwapActive) return false;
+  if (!r9SwapSnapshotValid) {
+    r9SwapActive = false;
+    r9RecordEvent(r9EventBlocked, r9ReasonSnapshotInvalid);
+    r9SavePersistentState();
+    return false;
+  }
+
+  let expectedBoostLevels = [
+    r9SwapPrevBoostLevels[0],
+    r9SwapPrevBoostLevels[1],
+    r9SwapPrevBoostLevels[2]
+  ];
+  let swapDuration = r9SwapTimer;
 
   // Remove only the temporary R1/R2/R3 swap purchases.
   r9RestoreBoostUpgrades();
@@ -2291,6 +2723,9 @@ function r9FinishSwap() {
   if (r9 !== undefined && r9.isAvailable)
     r9.buy(-1);
 
+  let validation = r9ValidateRestore(expectedBoostLevels);
+  r9RecordEvent(r9EventRestore, reason, swapDuration, validation);
+
   r9SwapActive = false;
   r9SwapTimer = 0;
   r9SwapCooldown = r9SwapCooldownSeconds;
@@ -2299,9 +2734,10 @@ function r9FinishSwap() {
   r9SwapSnapshotValid = false;
 
   r9ResetGrowthMonitor();
-  theory.invalidateQuaternaryValues();
+  r9SavePersistentState();
+  r9InvalidateStatusUi();
 
-  return true;
+  return validation == r9ValidationOk;
 }
 
 function r9LooksStrandedOutOfR9() {
@@ -2332,20 +2768,32 @@ function r9LooksStrandedOutOfR9() {
   return false;
 }
 
-function r9EmergencyRestoreR9() {
+function r9EmergencyRestoreR9(reason = r9ReasonStranded) {
   // Only restore automatically if we still have the exact swap snapshot.
   // If the script was reloaded and the snapshot was lost, DO NOT refund
   // all of R1/R2/R3. That would destroy the user's normal research setup.
   if (!r9SwapSnapshotValid) {
     r9StrandedRestoreTimer = 0;
+    r9RecordEvent(r9EventBlocked, r9ReasonSnapshotInvalid);
+    r9SavePersistentState();
     return false;
   }
+
+  let expectedBoostLevels = [
+    r9SwapPrevBoostLevels[0],
+    r9SwapPrevBoostLevels[1],
+    r9SwapPrevBoostLevels[2]
+  ];
+  let swapDuration = r9SwapTimer;
 
   r9RestoreBoostUpgrades();
 
   let r9 = game.researchUpgrades[8];
   if (r9 !== undefined && r9.isAvailable)
     r9.buy(-1);
+
+  let validation = r9ValidateRestore(expectedBoostLevels);
+  r9RecordEvent(r9EventEmergencyRestore, reason, swapDuration, validation);
 
   r9SwapActive = false;
   r9SwapTimer = 0;
@@ -2356,13 +2804,14 @@ function r9EmergencyRestoreR9() {
   r9SwapSnapshotValid = false;
 
   r9ResetGrowthMonitor();
-  theory.invalidateQuaternaryValues();
+  r9SavePersistentState();
+  r9InvalidateStatusUi();
 
-  return true;
+  return validation == r9ValidationOk;
 }
 
 function r9ObserveMainGameGrowth(elapsedTime) {
-  if (game.isCalculatingOfflineProgress) return;
+  r9LoadPersistentState();
 
   let dt = Math.max(0, elapsedTime);
 
@@ -2377,7 +2826,7 @@ function r9ObserveMainGameGrowth(elapsedTime) {
     r9StrandedRestoreTimer += dt;
 
     if (r9StrandedRestoreTimer >= r9StrandedRestoreSeconds) {
-      r9EmergencyRestoreR9();
+      r9EmergencyRestoreR9(r9ReasonStranded);
       return;
     }
   } else if (!r9SwapActive) {
@@ -2392,19 +2841,21 @@ function r9ObserveMainGameGrowth(elapsedTime) {
 
     // Hard safety return even if db cannot be read.
     if (r9SwapTimer >= r9SwapMaxDurationSeconds) {
-      r9FinishSwap();
+      r9FinishSwap(r9ReasonHardCap);
       return;
     }
 
-    if (logDb === null || isNaN(logDb) || !isFinite(logDb))
+    if (logDb === null || isNaN(logDb) || !isFinite(logDb)) {
+      r9PersistAfterObserve(dt);
       return;
+    }
 
     if (r9SwapPeakLogDb === null || logDb > r9SwapPeakLogDb)
       r9SwapPeakLogDb = logDb;
 
     // If db drops sharply while swapped, assume prestige/reset happened and return to R9.
     if (r9SwapPeakLogDb !== null && logDb < r9SwapPeakLogDb - 0.25) {
-      r9FinishSwap();
+      r9FinishSwap(r9ReasonDbReset);
       return;
     }
 
@@ -2424,28 +2875,35 @@ function r9ObserveMainGameGrowth(elapsedTime) {
       r9SwapTimer >= r9SwapMinDurationSeconds &&
       r9SwapNoProgressTimer >= r9SwapReturnNoProgressSeconds
     ) {
-      r9FinishSwap();
+      r9FinishSwap(r9ReasonNoProgress);
       return;
     }
 
+    r9PersistAfterObserve(dt);
     return;
   }
 
   // -------------------------
   // While normally holding R9
   // -------------------------
-  if (logDb === null || isNaN(logDb) || !isFinite(logDb)) return;
+  if (logDb === null || isNaN(logDb) || !isFinite(logDb)) {
+    r9PersistAfterObserve(dt);
+    return;
+  }
 
   // Initialize or reset after graduations / large db drops.
   if (r9RateLastLogDb === null || logDb < r9RateLastLogDb - 0.25) {
     r9ResetGrowthMonitor();
+    r9PersistAfterObserve(dt);
     return;
   }
 
   r9RateSampleTimer += dt;
 
-  if (r9RateSampleTimer < r9RateSampleIntervalSeconds)
+  if (r9RateSampleTimer < r9RateSampleIntervalSeconds) {
+    r9PersistAfterObserve(dt);
     return;
+  }
 
   let dbRate = (logDb - r9RateLastLogDb) / r9RateSampleTimer;
 
@@ -2455,6 +2913,7 @@ function r9ObserveMainGameGrowth(elapsedTime) {
   // Ignore negative samples; they usually mean a prestige/reset/update just happened.
   if (dbRate < 0) {
     r9ResetGrowthMonitor();
+    r9PersistAfterObserve(dt);
     return;
   }
 
@@ -2462,6 +2921,7 @@ function r9ObserveMainGameGrowth(elapsedTime) {
   if (dbRate > r9BestDbRate) {
     r9BestDbRate = dbRate;
     r9LowRateTimer = 0;
+    r9PersistAfterObserve(dt);
     return;
   }
 
@@ -2475,8 +2935,13 @@ function r9ObserveMainGameGrowth(elapsedTime) {
   else
     r9LowRateTimer = 0;
 
-  if (r9LowRateTimer >= r9SwapTriggerSeconds)
-    r9StartSwap(false);
+  if (r9LowRateTimer >= r9SwapTriggerSeconds) {
+    if (!r9StartSwap(false, r9ReasonLowRate))
+      r9PersistAfterObserve(dt);
+    return;
+  }
+
+  r9PersistAfterObserve(dt);
 }
 
 var r9Seap = () => {
@@ -2485,11 +2950,11 @@ var r9Seap = () => {
   // press again during the swap to restore R9 early.
   // If the script was reloaded while out of R9, recover R9 instead.
   if (r9SwapActive)
-    r9FinishSwap();
+    r9FinishSwap(r9ReasonManual);
   else if (r9LooksStrandedOutOfR9())
-    r9EmergencyRestoreR9();
+    r9EmergencyRestoreR9(r9ReasonManual);
   else
-    r9StartSwap(true);
+    r9StartSwap(true, r9ReasonManual);
 }
 
 class UIutils {
@@ -2751,6 +3216,11 @@ var tick = (elapsedTime, multiplier) => {
   enablePublications = theory.createUpgrade(10, fictitiousCurrency, new FreeCost);
 
   enableTheorySwitch = theory.createUpgrade(11, fictitiousCurrency, new FreeCost);
+
+  for (let i = 0; i < r9StateUpgradeCount; i++)
+    r9CreateHiddenStateUpgrade(i);
+
+  r9LoadPersistentState();
 }
 
 refreshTheoryManager(); // creating theory manager on initialization
