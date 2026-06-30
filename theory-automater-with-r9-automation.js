@@ -38,19 +38,23 @@ var r9SwapTriggerSeconds = 15;            // How long growth must be slow before
 var r9TriggerRelativeRate = 0.10;         // Trigger below 10% of recent best db rate.
 var r9TriggerAbsoluteRate = 0.02;         // Also trigger below this log10(db)/sec rate.
 var r9SwapMinDurationSeconds = 20;        // Never swap back before this unless prestige/reset is detected.
-var r9SwapMaxDurationSeconds = 90;        // Never stay out of R9 longer than this.
+var r9SwapMaxDurationSeconds = 60;        // Standard cap while db < 0.3*b.
+var r9SwapPrestigeMaxDurationSeconds = 500; // Lenient cap while db > 0.3*b.
+var r9SwapPrestigeThresholdLog = Math.log10(0.3);
 var r9SwapReturnNoProgressSeconds = 10;   // After min duration, return if swapped growth stalls this long.
 var r9SwapReturnMinProgress = 0.05;       // Needs this much log10(db) gain to count as progress.
 var r9SwapCooldownSeconds = 30;           // Prevent immediate re-trigger after swapping back.
 var r9StrandedRestoreTimer = 0;           // Detects reloads while stuck out of R9.
 var r9StrandedRestoreSeconds = 5;         // Auto-restore if stranded for this long.
+var r9SwapPrestigeTimer = 0;              // Separate cap timer that starts when db becomes greater than 0.3*b.
+var r9SwapPrestigeTimerActive = false;
 
 // Persisted R9 swap state. Custom upgrade levels are saved by the game, unlike
 // plain JavaScript variables, so these slots make offline/reload swaps safe.
 var r9StateUpgrades = [];
 var r9StateLoaded = false;
 var r9StateStartId = 12;
-var r9StateUpgradeCount = 35;
+var r9StateUpgradeCount = 37;
 var r9StateTimerScale = 10;
 var r9StateFloatScale = 10000;
 var r9UiRefreshTimer = 0;
@@ -77,6 +81,8 @@ var r9StateEventSequenceSlot = 22;
 var r9StateEventBaseSlot = 23;
 var r9StateEventSlotSize = 3;
 var r9StateEventCount = 4;
+var r9StatePrestigeTimerSlot = 35;
+var r9StatePrestigeTimerActiveSlot = 36;
 
 var r9ReasonNone = 0;
 var r9ReasonLowRate = 1;
@@ -2322,6 +2328,8 @@ function r9SavePersistentState() {
   r9WriteStateSlot(r9StateLastRestoreReasonSlot, r9LastRestoreReason);
   r9WriteStateSlot(r9StateAutoSwapCountSlot, r9AutoSwapCount);
   r9WriteStateSlot(r9StateEventSequenceSlot, r9EventSequence);
+  r9WriteStateSlot(r9StatePrestigeTimerSlot, r9EncodeTimer(r9SwapPrestigeTimer));
+  r9WriteStateSlot(r9StatePrestigeTimerActiveSlot, r9SwapPrestigeTimerActive ? 1 : 0);
 }
 
 function r9LoadPersistentState() {
@@ -2350,9 +2358,13 @@ function r9LoadPersistentState() {
   r9LastRestoreReason = r9ReadStateSlot(r9StateLastRestoreReasonSlot);
   r9AutoSwapCount = r9ReadStateSlot(r9StateAutoSwapCountSlot);
   r9EventSequence = r9ReadStateSlot(r9StateEventSequenceSlot);
+  r9SwapPrestigeTimer = r9DecodeTimer(r9ReadStateSlot(r9StatePrestigeTimerSlot));
+  r9SwapPrestigeTimerActive = r9ReadStateSlot(r9StatePrestigeTimerActiveSlot) > 0;
 
   if (r9SwapActive && !r9SwapSnapshotValid) {
     r9SwapActive = false;
+    r9SwapPrestigeTimer = 0;
+    r9SwapPrestigeTimerActive = false;
     r9LastRestoreReason = r9ReasonSnapshotInvalid;
   }
 
@@ -2363,6 +2375,8 @@ function r9LoadPersistentState() {
     r9SwapPrevBoostLevels = [0, 0, 0];
     r9SwapBoughtBoostLevels = [0, 0, 0];
     r9SwapSnapshotValid = false;
+    r9SwapPrestigeTimer = 0;
+    r9SwapPrestigeTimerActive = false;
     r9LastRestoreReason = r9ReasonManual;
   }
 
@@ -2570,6 +2584,44 @@ function r9GetLogDb() {
   }
 }
 
+function r9GetLogB() {
+  try {
+    if (game.b <= 0) return null;
+
+    let logB = game.b.log10();
+    if (logB.toNumber !== undefined)
+      return logB.toNumber();
+
+    return parseFloat("" + logB);
+  } catch (e) {
+    return null;
+  }
+}
+
+function r9IsPrestigeProgressing(logDb) {
+  let logB = r9GetLogB();
+  if (logDb === null || logB === null) return false;
+  if (isNaN(logDb) || isNaN(logB) || !isFinite(logDb) || !isFinite(logB)) return false;
+
+  return logDb > logB + r9SwapPrestigeThresholdLog;
+}
+
+function r9GetCurrentHardCap(logDb, dt) {
+  if (r9IsPrestigeProgressing(logDb)) {
+    if (!r9SwapPrestigeTimerActive) {
+      r9SwapPrestigeTimer = 0;
+      r9SwapPrestigeTimerActive = true;
+    }
+
+    r9SwapPrestigeTimer += dt;
+    return [r9SwapPrestigeTimer, r9SwapPrestigeMaxDurationSeconds];
+  }
+
+  r9SwapPrestigeTimer = 0;
+  r9SwapPrestigeTimerActive = false;
+  return [r9SwapTimer, r9SwapMaxDurationSeconds];
+}
+
 function r9ResetGrowthMonitor() {
   let logDb = r9GetLogDb();
 
@@ -2685,6 +2737,8 @@ function r9StartSwap(manual = false, reason = r9ReasonLowRate) {
     r9SwapPrevBoostLevels = [0, 0, 0];
     r9SwapBoughtBoostLevels = [0, 0, 0];
     r9SwapSnapshotValid = false;
+    r9SwapPrestigeTimer = 0;
+    r9SwapPrestigeTimerActive = false;
     r9ResetGrowthMonitor();
     r9SavePersistentState();
     return false;
@@ -2692,6 +2746,8 @@ function r9StartSwap(manual = false, reason = r9ReasonLowRate) {
 
   r9SwapActive = true;
   r9SwapTimer = 0;
+  r9SwapPrestigeTimer = 0;
+  r9SwapPrestigeTimerActive = false;
   r9ResetSwapMonitor();
   r9RecordEvent(manual ? r9EventManualSwap : r9EventAutoSwap, reason);
   r9InvalidateStatusUi();
@@ -2703,6 +2759,8 @@ function r9FinishSwap(reason = r9ReasonManual) {
   if (!r9SwapActive) return false;
   if (!r9SwapSnapshotValid) {
     r9SwapActive = false;
+    r9SwapPrestigeTimer = 0;
+    r9SwapPrestigeTimerActive = false;
     r9RecordEvent(r9EventBlocked, r9ReasonSnapshotInvalid);
     r9SavePersistentState();
     return false;
@@ -2728,6 +2786,8 @@ function r9FinishSwap(reason = r9ReasonManual) {
 
   r9SwapActive = false;
   r9SwapTimer = 0;
+  r9SwapPrestigeTimer = 0;
+  r9SwapPrestigeTimerActive = false;
   r9SwapCooldown = r9SwapCooldownSeconds;
   r9SwapPrevBoostLevels = [0, 0, 0];
   r9SwapBoughtBoostLevels = [0, 0, 0];
@@ -2774,6 +2834,8 @@ function r9EmergencyRestoreR9(reason = r9ReasonStranded) {
   // all of R1/R2/R3. That would destroy the user's normal research setup.
   if (!r9SwapSnapshotValid) {
     r9StrandedRestoreTimer = 0;
+    r9SwapPrestigeTimer = 0;
+    r9SwapPrestigeTimerActive = false;
     r9RecordEvent(r9EventBlocked, r9ReasonSnapshotInvalid);
     r9SavePersistentState();
     return false;
@@ -2797,6 +2859,8 @@ function r9EmergencyRestoreR9(reason = r9ReasonStranded) {
 
   r9SwapActive = false;
   r9SwapTimer = 0;
+  r9SwapPrestigeTimer = 0;
+  r9SwapPrestigeTimerActive = false;
   r9SwapCooldown = r9SwapCooldownSeconds;
   r9StrandedRestoreTimer = 0;
   r9SwapPrevBoostLevels = [0, 0, 0];
@@ -2839,8 +2903,10 @@ function r9ObserveMainGameGrowth(elapsedTime) {
   if (r9SwapActive) {
     r9SwapTimer += dt;
 
-    // Hard safety return even if db cannot be read.
-    if (r9SwapTimer >= r9SwapMaxDurationSeconds) {
+    let hardCap = r9GetCurrentHardCap(logDb, dt);
+
+    // Hard safety return even if b/db cannot be read.
+    if (hardCap[0] >= hardCap[1]) {
       r9FinishSwap(r9ReasonHardCap);
       return;
     }
